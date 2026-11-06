@@ -10,7 +10,8 @@ successor of Jeroen Vleggaar's (Huygens Optics) **Wave Dude 2D**, GPL-3.0-or-lat
 VB source and the C# port of his binary live in git history up to `d3ac0d8`; read his VB there when his intent
 matters. The harnesses are `_tools/library_check` (console, not in the `.sln`) and `_tools/ui_check` (PowerShell).
 The user works in Visual Studio with Claude Code in the chat, permissions skipped, often at the machine while
-harnesses run.
+harnesses run. **The Linux port** (Avalonia beside WPF, 2026-11-06) has its notes in `Port/Linux.md`: read them before
+any work on Linux.
 
 ## How to work here (the user's rules)
 

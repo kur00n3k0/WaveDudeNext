@@ -27,9 +27,10 @@ namespace WaveDudeNext.Runs;
 /// drive optimiser goes by. Asked with <c>IOCTL_STORAGE_QUERY_PROPERTY</c> on handles opened without access rights, so
 /// no elevation is needed: of the volume first, which answers for the disk beneath a simple volume, then of each disk
 /// the volume lies on. A RAID controller's virtual disk answers neither way (the workstation's C: on a PERC H310, whose
-/// media type Windows itself calls unspecified, while its member SSDs answer), so the kind can stay unknown. Thread-free.
+/// media type Windows itself calls unspecified, while its member SSDs answer), so the kind can stay unknown. Linux
+/// answers through the kernel's rotational flag (<c>StorageDevice.Linux.cs</c>). Thread-free.
 /// </summary>
-public static class StorageDevice
+public static partial class StorageDevice
 {
 	private const uint FileShareRead = 0x1U;
 	private const uint FileShareWrite = 0x2U;
@@ -52,12 +53,17 @@ public static class StorageDevice
 
 	/// <summary>
 	/// Whether the volume holding <paramref name="path"/> incurs a seek penalty: true for a hard disk, or a volume with
-	/// one among its disks; false for solid-state drives; null when the question cannot be answered (not Windows, a
-	/// relative or UNC path, a volume and disks that do not report the property). The path need not exist; only its
-	/// drive letter is used.
+	/// one among its disks; false for solid-state drives; null when the question cannot be answered (neither Windows nor
+	/// Linux, a relative or UNC path, a volume and disks that do not report the property, a file system on no block
+	/// device). The path need not exist; on Windows only its drive letter is used, on Linux the mount holding its
+	/// nearest existing folder.
 	/// </summary>
 	public static bool? IncursSeekPenalty(string path)
 	{
+		if (OperatingSystem.IsLinux())
+		{
+			return LinuxSeekPenalty(path);
+		}
 		if (!OperatingSystem.IsWindows())
 		{
 			return null;

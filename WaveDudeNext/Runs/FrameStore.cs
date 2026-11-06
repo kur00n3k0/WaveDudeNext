@@ -33,7 +33,8 @@ namespace WaveDudeNext.Runs;
 /// a run does not fit. A run that fits never touches the disk, so it is bound by the engine and not by the
 /// drive; a run that does not fit is disk-bound for its tail only. The file is pre-sized for the frames it
 /// will hold, marked temporary, and deleted when the store is disposed or the process ends
-/// (<see cref="FileOptions.DeleteOnClose"/>).
+/// (<see cref="FileOptions.DeleteOnClose"/>; outside Windows it is unlinked as soon as it is open, so a crashed process
+/// leaves nothing either: the kernel frees an unlinked file's blocks when its last handle closes).
 /// </summary>
 /// <remarks>
 /// Why not the operating system's cache or a memory mapping: both keep dirty pages in memory only up to
@@ -613,19 +614,27 @@ public sealed unsafe class FrameStore : IFrameSource, IDisposable
 		_file = new FileStream(Path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.DeleteOnClose);
 		try
 		{
-			// a temporary file: the cache manager keeps its pages in memory while it can instead of writing
-			// them out eagerly (a hint only); the file is deleted in the end
-			try
+			if (OperatingSystem.IsWindows())
 			{
-				File.SetAttributes(Path, FileAttributes.Temporary | FileAttributes.NotContentIndexed);
+				// a temporary file: the cache manager keeps its pages in memory while it can instead of writing
+				// them out eagerly (a hint only); the file is deleted in the end
+				try
+				{
+					File.SetAttributes(Path, FileAttributes.Temporary | FileAttributes.NotContentIndexed);
+				}
+				catch (IOException)
+				{
+					// a hint only
+				}
+				catch (UnauthorizedAccessException)
+				{
+					// a hint only
+				}
 			}
-			catch (IOException)
+			else
 			{
-				// a hint only
-			}
-			catch (UnauthorizedAccessException)
-			{
-				// a hint only
+				// the name goes now, the handle keeps the file: nothing is left behind however the process ends
+				File.Delete(Path);
 			}
 			_file.SetLength(HeaderSize + (Capacity - firstFrame) * FrameBytes);
 			_handle = _file.SafeFileHandle;

@@ -21,8 +21,9 @@ using NLog;
 namespace WaveDudeNext.Runs;
 
 /// <summary>
-/// Where <see cref="FrameStore"/> files live: one per run under the user's local application data, named so
-/// that a leftover of a crashed process is recognisable. UI thread.
+/// Where <see cref="FrameStore"/> files live: one per run under the user's local application data on Windows, in a
+/// folder of the user's own under <c>/var/tmp</c> on Linux, named so that a leftover of a crashed process is
+/// recognisable. UI thread.
 /// </summary>
 public static class FrameCache
 {
@@ -32,14 +33,42 @@ public static class FrameCache
 	/// <summary>File extension of a frame store.</summary>
 	public const string Extension = ".wdframes";
 
-	/// <summary><c>%LOCALAPPDATA%\WaveDudeNext\cache</c>; created on first use.</summary>
-	public static string Directory { get; } =
-		Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WaveDudeNext", "cache");
+	/// <summary>
+	/// <c>%LOCALAPPDATA%\WaveDudeNext\cache</c> on Windows; <c>/var/tmp/WaveDudeNext-&lt;user&gt;</c> on Linux (2026-11-06,
+	/// the user's choice: never in memory, where <c>/tmp</c> often is, a tmpfs, so a spill there would take the memory it
+	/// spares). Created on first use, on Linux for its owner alone (<see cref="EnsureDirectory"/>).
+	/// </summary>
+	public static string Directory { get; } = OperatingSystem.IsLinux()
+		? Path.Combine("/var/tmp", "WaveDudeNext-" + Environment.UserName)
+		: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WaveDudeNext", "cache");
+
+	/// <summary>Permissions of the Linux cache folder: its owner's alone.</summary>
+	private const UnixFileMode OwnerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+
+	/// <summary>
+	/// Creates <see cref="Directory"/> when it is missing. Outside Windows it is made for its owner alone, and an existing
+	/// one that is a link or open to others is refused: <c>/var/tmp</c> is shared by every user, so a folder of that name
+	/// may be someone else's (one of another user without these rights fails at the file's creation instead).
+	/// </summary>
+	/// <exception cref="RunSpecException">The folder is a link or open to other users.</exception>
+	private static void EnsureDirectory()
+	{
+		if (OperatingSystem.IsWindows())
+		{
+			System.IO.Directory.CreateDirectory(Directory);
+			return;
+		}
+		DirectoryInfo folder = System.IO.Directory.CreateDirectory(Directory, OwnerOnly);
+		if (folder.LinkTarget != null || (folder.UnixFileMode & ~(OwnerOnly | UnixFileMode.SetGroup | UnixFileMode.SetUser | UnixFileMode.StickyBit)) != 0)
+		{
+			throw new RunSpecException($"The frame cache folder {Directory} is a link or open to other users; remove it, or make it a folder of yours alone.");
+		}
+	}
 
 	/// <summary>A fresh file path for a run's store: <c>run-&lt;time&gt;-&lt;pid&gt;-&lt;n&gt;.wdframes</c> in <see cref="Directory"/>.</summary>
 	public static string NewPath()
 	{
-		System.IO.Directory.CreateDirectory(Directory);
+		EnsureDirectory();
 		int n = Interlocked.Increment(ref _sequence);
 		return Path.Combine(Directory, $"run-{DateTime.Now:yyyyMMdd-HHmmss}-{Environment.ProcessId}-{n}{Extension}");
 	}
@@ -50,8 +79,8 @@ public static class FrameCache
 	/// <exception cref="RunSpecException">Not enough free space; the message states the size needed.</exception>
 	public static void CheckSpace(long bytes)
 	{
-		System.IO.Directory.CreateDirectory(Directory);
-		var drive = new DriveInfo(Path.GetPathRoot(Directory) ?? Directory);
+		EnsureDirectory();
+		var drive = new DriveInfo(OperatingSystem.IsWindows() ? Path.GetPathRoot(Directory) ?? Directory : StorageDevice.MountPoint(Directory) ?? "/");
 		long needed = bytes + (64L << 20);
 		if (drive.AvailableFreeSpace < needed)
 		{

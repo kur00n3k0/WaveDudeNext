@@ -24,8 +24,8 @@ namespace WaveDudeNext.Runs;
 /// when a run starts, from what the machine has to spare at that moment: a share of the physical memory (the
 /// user's setting), but never more than what is available now minus a margin for the rest of the application
 /// and the system, so a run never pushes the machine into its page file. Windows answers through
-/// <c>GlobalMemoryStatusEx</c>; elsewhere the runtime's view of the total serves, with half of it taken as
-/// available. Thread-free.
+/// <c>GlobalMemoryStatusEx</c>, Linux through <c>/proc/meminfo</c>; elsewhere the runtime's view of the total
+/// serves, with half of it taken as available. Thread-free.
 /// </summary>
 public static class FrameMemory
 {
@@ -61,7 +61,57 @@ public static class FrameMemory
 		{
 			return (long)Math.Min(Math.Min(status.AvailPhys, status.AvailPageFile), long.MaxValue);
 		}
+		if (OperatingSystem.IsLinux() && TryLinuxAvailable(out long available))
+		{
+			return available;
+		}
 		return PhysicalBytes() / 2;
+	}
+
+	/// <summary>
+	/// Linux's measure (2026-11-06): <c>MemAvailable</c>, the kernel's estimate of what new allocations can take without
+	/// swapping, the reclaimable page cache included, as Windows counts its standby list; under strict overcommit
+	/// (<c>vm.overcommit_memory</c> 2, where the kernel refuses an allocation at the commit limit as Windows does) no more
+	/// than <c>CommitLimit</c> minus <c>Committed_AS</c>. In the default heuristic mode the commit figures bound nothing:
+	/// pages are taken when touched, and the margin below what is available is what keeps the machine out of its swap.
+	/// </summary>
+	private static bool TryLinuxAvailable(out long available)
+	{
+		available = 0;
+		long memAvailable = -1;
+		long commitLimit = -1;
+		long committed = -1;
+		try
+		{
+			foreach (string line in File.ReadLines("/proc/meminfo"))
+			{
+				memAvailable = line.StartsWith("MemAvailable:", StringComparison.Ordinal) ? Kilobytes(line) : memAvailable;
+				commitLimit = line.StartsWith("CommitLimit:", StringComparison.Ordinal) ? Kilobytes(line) : commitLimit;
+				committed = line.StartsWith("Committed_AS:", StringComparison.Ordinal) ? Kilobytes(line) : committed;
+			}
+			bool strict = File.ReadAllText("/proc/sys/vm/overcommit_memory").Trim() == "2";
+			if (memAvailable < 0)
+			{
+				return false;
+			}
+			available = strict && commitLimit >= 0 && committed >= 0 ? Math.Min(memAvailable, Math.Max(0, commitLimit - committed)) : memAvailable;
+			return true;
+		}
+		catch (IOException)
+		{
+			return false;
+		}
+		catch (UnauthorizedAccessException)
+		{
+			return false;
+		}
+	}
+
+	/// <summary>The value of a <c>/proc/meminfo</c> line ("Name:   12345 kB") in bytes; -1 when it does not parse.</summary>
+	private static long Kilobytes(string line)
+	{
+		string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+		return parts.Length >= 2 && long.TryParse(parts[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long kilobytes) ? kilobytes * 1024 : -1;
 	}
 
 	/// <summary>

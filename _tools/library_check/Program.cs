@@ -1573,6 +1573,35 @@ internal static class Program
 		Check(Emitter.FromProject(project).Count == 0, "scene without object sources gives no emitters");
 	}
 
+	/// <summary>
+	/// The length of a store's open file: by its path on Windows; elsewhere through the process's open files, since the
+	/// store unlinks the name as soon as the file is open (Linux lists it as "&lt;path&gt; (deleted)"), measured on that
+	/// descriptor itself, the store's own handle, borrowed (the link's own length is that of its text); -1 when not found.
+	/// </summary>
+	private static long StoreFileLength(string path)
+	{
+		if (OperatingSystem.IsWindows())
+		{
+			return File.Exists(path) ? new FileInfo(path).Length : -1;
+		}
+		foreach (string fd in Directory.GetFiles("/proc/self/fd"))
+		{
+			try
+			{
+				if (new FileInfo(fd).LinkTarget == path + " (deleted)" && int.TryParse(Path.GetFileName(fd), out int number))
+				{
+					using var borrowed = new Microsoft.Win32.SafeHandles.SafeFileHandle(number, ownsHandle: false);
+					return RandomAccess.GetLength(borrowed);
+				}
+			}
+			catch (IOException)
+			{
+				// closed while listed
+			}
+		}
+		return -1;
+	}
+
 	private static void CheckFrameStore(SceneData scene)
 	{
 		Console.WriteLine("--- frame store");
@@ -1580,7 +1609,11 @@ internal static class Program
 		var cpu = new WaveSimulator(scene, new EngineOptions(1.0, 1.0, true, false, 10.0, 1.0), Sources());
 		using (var store = FrameStore.Create(path, scene.Width, scene.Height, FrameLayers.Field | FrameLayers.Intensity, 3, 2, ramBudget: 0))
 		{
-			Check(store.RamFrames == 0 && store.HasFile && File.Exists(path) && new FileInfo(path).Length == store.FileBytes && store.FileBytes == FrameStore.HeaderSize + 3 * store.FrameBytes, "no budget: the file is created at once and pre-sized (" + store.FileBytes + " bytes)");
+			Check(store.RamFrames == 0 && store.HasFile && StoreFileLength(path) == store.FileBytes && store.FileBytes == FrameStore.HeaderSize + 3 * store.FrameBytes, "no budget: the file is created at once and pre-sized (" + store.FileBytes + " bytes)");
+			if (!OperatingSystem.IsWindows())
+			{
+				Check(!File.Exists(path) && StoreFileLength(path) > 0, "no budget: outside Windows the file's name is gone while it is open, its handle holding it");
+			}
 			Check(store.Count == 0 && store.LayerCount == 2 && store.Has(FrameLayer.Intensity) && store.StepOf(2) == 4, "empty store reports its layout");
 			int written = 0;
 			store.FrameWritten += n => written = n;
@@ -1644,7 +1677,7 @@ internal static class Program
 		path = Path.Combine(Path.GetTempPath(), "library_check-tiers-" + Guid.NewGuid().ToString("N") + FrameCache.Extension);
 		using (var store = FrameStore.Create(path, scene.Width, scene.Height, FrameLayers.Field | FrameLayers.Intensity, 5, 2, ramBudget: 2L * 2 * scene.Width * scene.Height * 2))
 		{
-			Check(store.RamFrames == 2 && store.FirstSpilledFrame == 2 && store.HasFile && new FileInfo(path).Length == FrameStore.HeaderSize + 3 * store.FrameBytes, "budget for two frames: the file is sized for the other three");
+			Check(store.RamFrames == 2 && store.FirstSpilledFrame == 2 && store.HasFile && StoreFileLength(path) == FrameStore.HeaderSize + 3 * store.FrameBytes, "budget for two frames: the file is sized for the other three");
 			float[][] fields = new float[5][];
 			for (int frame = 0; frame < 5; frame++)
 			{

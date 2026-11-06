@@ -29,8 +29,8 @@ namespace WaveDudeNext.Runs;
 /// <param name="PhysicalBytes">Bytes of physical memory as Windows reports them, a little under the nominal size (about 15.9 GB on a 16 GB machine).</param>
 /// <param name="Threads">Logical processors.</param>
 /// <param name="Gpu">The OpenCL GPU the engine would take, by name, "(shared memory)" added for one integrated with the processor; empty when there is none or OpenCL is missing.</param>
-/// <param name="CacheDrive">The frame cache's drive for a log line ("C:"), or the cache folder's root when it has no drive letter.</param>
-/// <param name="CacheDriveSeekPenalty">Whether the cache drive incurs a seek penalty, a hard disk; null when Windows cannot say (<see cref="StorageDevice.IncursSeekPenalty"/>).</param>
+/// <param name="CacheDrive">The frame cache's drive for a log line ("C:"), on Linux its mount point ("/"), else the cache folder's root.</param>
+/// <param name="CacheDriveSeekPenalty">Whether the cache drive incurs a seek penalty, a hard disk; null when the system cannot say (<see cref="StorageDevice.IncursSeekPenalty"/>).</param>
 public sealed record MachineFacts(long PhysicalBytes, int Threads, string Gpu, string CacheDrive, bool? CacheDriveSeekPenalty)
 {
 	/// <summary>Reads the facts of this machine; a missing OpenCL runtime counts as no GPU.</summary>
@@ -49,6 +49,7 @@ public sealed record MachineFacts(long PhysicalBytes, int Threads, string Gpu, s
 			// no OpenCL runtime: the CPU engine serves
 		}
 		string root = Path.GetPathRoot(FrameCache.Directory) ?? FrameCache.Directory;
-		return new MachineFacts(FrameMemory.PhysicalBytes(), Environment.ProcessorCount, gpu, root.TrimEnd('\\'), StorageDevice.IncursSeekPenalty(FrameCache.Directory));
+		string drive = StorageDevice.MountPoint(FrameCache.Directory) ?? root.TrimEnd('\\');
+		return new MachineFacts(FrameMemory.PhysicalBytes(), Environment.ProcessorCount, gpu, drive, StorageDevice.IncursSeekPenalty(FrameCache.Directory));
 	}
 }

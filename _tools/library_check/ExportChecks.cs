@@ -20,6 +20,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
 using WaveDudeNext.Export;
 using WaveDudeNext.Model;
@@ -85,7 +86,9 @@ internal static class ExportChecks
 			rows = ProbeCsv.Write(text, csvLine, lineTrace, 2, 1);
 			lines = text.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
 			check(rows == 2 && lines is ["frame;step;0;2;4", "0;0;1;2;3", "1;2;4;5.5;6"], "probe csv: a line probe gives one row per frame, frame and step first, the distances along the line as column heads (" + string.Join(" | ", lines) + ")");
-			check(ProbeCsv.FileName("ball", new Probe { Name = "A/B: focus" }) == "ball_A_B_ focus.csv" && ProbeCsv.FileName("ball", new Probe { Name = " " }) == "ball_probe.csv", "probe csv: the proposed name is <project>_<probe>.csv with invalid characters replaced");
+			// the characters the operating system forbids (2026-11-06, the user's choice): Linux keeps the colon Windows refuses
+			string expectedCsv = OperatingSystem.IsWindows() ? "ball_A_B_ focus.csv" : "ball_A_B: focus.csv";
+			check(ProbeCsv.FileName("ball", new Probe { Name = "A/B: focus" }) == expectedCsv && ProbeCsv.FileName("ball", new Probe { Name = " " }) == "ball_probe.csv", "probe csv: the proposed name is <project>_<probe>.csv with the characters this system forbids replaced (" + expectedCsv + ")");
 
 			// JPEG: a baseline file ffmpeg decodes close to the original
 			var jpeg = new JpegEncoder(w, h, 90);
@@ -313,9 +316,13 @@ internal static class ExportChecks
 					check(false, "mp4: " + ex.Message);
 				}
 			}
+			else if (!OperatingSystem.IsWindows() && ExportFormats.IsAvailable(ExportFormat.Mp4))
+			{
+				CheckFfmpegMp4(check, folder, frames, w, h);
+			}
 			else
 			{
-				Console.WriteLine("  skip mp4: Media Foundation not available");
+				Console.WriteLine(OperatingSystem.IsWindows() ? "  skip mp4: Media Foundation not available" : "  skip mp4: no ffmpeg with an H.264 encoder on the PATH");
 			}
 
 			// formats
@@ -373,16 +380,16 @@ internal static class ExportChecks
 				"formats: exr_0001.exr is a version 2 scanline file, channel Y half, uncompressed, with the halves bit for bit" + (back == null ? " (" + (File.Exists(exrFile) ? exrNote : "no file") + ")" : ""));
 			if (Ffmpeg != null)
 			{
-				// decoded to 16-bit grey, the one form every ffmpeg since 2018 gives for a one-channel EXR: value × 65536,
-				// clipped to 0..65535 (the negatives and the 1.5 land on the limits); so the values and their places are checked
-				ushort[]? decodedExr = DecodeGray16(exrFile, w, h);
+				// decoded to float grey, clipped to 0..1 by the decoder (the negatives and the 1.5 land on the limits), so the
+				// values and their places are checked; float, since ffmpeg 9 converts to 16-bit grey as limited range (0.05
+				// came out 0, 0.5 as 33516; 2026-11-06), and an ffmpeg before 4.3, which decoded to 16 bits, is within 2/65536
+				float[]? decodedExr = DecodeGrayFloat(exrFile, w, h);
 				bool same = decodedExr != null;
 				for (int i = 0; same && i < halves.Length; i++)
 				{
-					int expected = (int)Math.Clamp(Math.Round((float)halves[i] * 65536f), 0, 65535);
-					same = Math.Abs(decodedExr![i] - expected) <= 2;
+					same = Math.Abs(decodedExr![i] - Math.Clamp((float)halves[i], 0f, 1f)) <= 2f / 65536f;
 				}
-				check(same, "formats: ffmpeg decodes the OpenEXR file to the same values (16-bit grey, value × 65536, clipped)");
+				check(same, "formats: ffmpeg decodes the OpenEXR file to the same values (float grey, clipped to 0..1)");
 			}
 			string exrStill = Path.Combine(folder, "still.exr");
 			using (IFrameSink still = ExportFormats.OpenStill(ExportFormat.Exr, exrStill, w, h, 70))
@@ -571,8 +578,9 @@ internal static class ExportChecks
 		var unopenable = new ExportJob(store, 0, 1, [new ExportTarget(intensityLayer, "nowhere", () => throw new IOException("no such drive"))], null);
 		unopenable.Start();
 		check(unopenable.Completion.Wait(10000) && unopenable.State == ExportState.Failed && unopenable.Error is IOException && unopenable.FramesDone == 0, "job: a sink that cannot open fails the job with its error");
-		// an MP4 written by the job: the Media Foundation writer lives on the job's thread (it refused a caller's thread, 2026-10-14)
-		if (OperatingSystem.IsWindows() && ExportFormats.IsAvailable(ExportFormat.Mp4))
+		// an MP4 written by the job: the Media Foundation writer lives on the job's thread (it refused a caller's thread,
+		// 2026-10-14); the ffmpeg writer outside Windows the same way
+		if (ExportFormats.IsAvailable(ExportFormat.Mp4))
 		{
 			string mp4Path = Path.Combine(folder, "job.mp4");
 			var mp4Job = new ExportJob(store, 0, 9, [new ExportTarget(fieldLayer, mp4Path, () => ExportFormats.Open(ExportFormat.Mp4, mp4Path, 64, 48, 30, 70, 10))], null);
@@ -609,27 +617,7 @@ internal static class ExportChecks
 			// the WIC codec of Windows called natively at 4:4:4 (the app's path), timed and compared at the same quality
 			if (OperatingSystem.IsWindows())
 			{
-				byte[] inHouse = jpeg.Encode(frame);
-				byte[] wic = [];
-				Time("jpeg encode by WIC (q 85)", () => wic = WicEncode(frame, w, h, 85), 5);
-				File.WriteAllBytes(Path.Combine(folder, "wic.jpg"), wic);
-				File.WriteAllBytes(Path.Combine(folder, "inhouse.jpg"), inHouse);
-				double wicDb = 0;
-				double inHouseDb = 0;
-				if (Ffmpeg != null)
-				{
-					byte[]? rgb = Decode(Path.Combine(folder, "wic.jpg"), w, h, out int n);
-					wicDb = rgb == null || n != 1 ? 0 : Psnr(rgb, frame, w, h);
-					rgb = Decode(Path.Combine(folder, "inhouse.jpg"), w, h, out n);
-					inHouseDb = rgb == null || n != 1 ? 0 : Psnr(rgb, frame, w, h);
-				}
-				Console.WriteLine($"    at quality 85: WIC {wic.Length / 1024} KB at {wicDb:0.0} dB, in-house {inHouse.Length / 1024} KB at {inHouseDb:0.0} dB");
-				foreach (int q in new[] { 50, 70, 95 })
-				{
-					byte[] a = WicEncode(frame, w, h, q);
-					byte[] b = new JpegEncoder(w, h, q).Encode(frame);
-					Console.WriteLine($"    at quality {q}: WIC {a.Length / 1024} KB, in-house {b.Length / 1024} KB");
-				}
+				BenchWic(frame, w, h, jpeg, folder);
 			}
 			// the per-block costs, single-threaded over as many blocks as a frame has
 			int blocks = planes.MacroblockColumns * planes.MacroblockRows * (planes.Subsampled ? 6 : 12);
@@ -649,9 +637,13 @@ internal static class ExportChecks
 			}
 			if (OperatingSystem.IsWindows() && ExportFormats.IsAvailable(ExportFormat.Mp4))
 			{
-				using var mp4 = new Mp4Writer(Path.Combine(folder, "b.mp4"), w, h, 30, 85);
-				Console.WriteLine("  mp4: " + (mp4.Nv12Input ? "NV12" : "RGB32") + " in, " + mp4.Transforms + (mp4.HasDirect3D ? ", Direct3D device shared" : ", system memory") + "; hardware H.264 encoders registered: " + string.Join(", ", Mp4Writer.AvailableEncoders(hardwareOnly: true).DefaultIfEmpty("none")));
-				Time("mp4 frame (Media Foundation)", () => mp4.Add(frame), 10);
+				BenchMp4(frame, w, h, folder);
+			}
+			else if (ExportFormats.IsAvailable(ExportFormat.Mp4))
+			{
+				using var mp4 = new FfmpegMp4Writer(Path.Combine(folder, "b.mp4"), w, h, 30, 85);
+				Console.WriteLine("  mp4: ffmpeg's " + mp4.Encoder + "; its H.264 encoders: " + string.Join(", ", FfmpegMp4Writer.AvailableEncoders()));
+				Time("mp4 frame (ffmpeg, " + mp4.Encoder + ")", () => mp4.Add(frame), 10);
 			}
 			// the sequence sink's workers: PNG with one worker and with the default, ten frames each
 			foreach (int workers in new[] { 1, ExportFormats.SequenceWorkers(encoderIsParallel: false) })
@@ -762,7 +754,7 @@ internal static class ExportChecks
 				}
 			}
 			Func<int, int, int, Action<Stream, ReadOnlyMemory<int>>>? preferredJpeg = ExportFormats.PreferredJpeg;
-			foreach ((string name, Func<IFrameSink> open) in new (string, Func<IFrameSink>)[]
+			var sinks = new List<(string Name, Func<IFrameSink> Open)>
 			{
 				("png sequence", () => ExportFormats.Open(ExportFormat.Png, Path.Combine(folder, "j.png"), w, h, 30, 85, 60)),
 				("jpeg sequence (in-house)", () => { ExportFormats.PreferredJpeg = null; return ExportFormats.Open(ExportFormat.Jpeg, Path.Combine(folder, "j.jpg"), w, h, 30, 85, 60); }),
@@ -770,11 +762,19 @@ internal static class ExportChecks
 				("mpeg-1", () => ExportFormats.Open(ExportFormat.Mpeg1, Path.Combine(folder, "j.mpg"), w, h, 30, 85, 60)),
 				("avi", () => ExportFormats.Open(ExportFormat.Avi, Path.Combine(folder, "j.avi"), w, h, 30, 85, 60)),
 				("mov (Animation)", () => ExportFormats.Open(ExportFormat.Mov, Path.Combine(folder, "j.mov"), w, h, 30, 85, 60)),
-				("mp4", () => ExportFormats.Open(ExportFormat.Mp4, Path.Combine(folder, "j.mp4"), w, h, 30, 85, 60)),
-				("mp4, writer not throttling", () => { Mp4Writer.Throttle = false; return ExportFormats.Open(ExportFormat.Mp4, Path.Combine(folder, "k.mp4"), w, h, 30, 85, 60); }),
-			})
+			};
+			// MP4 where it can be written; the throttle is Media Foundation's (the entry had run unguarded)
+			if (ExportFormats.IsAvailable(ExportFormat.Mp4))
 			{
-				if ((name == "mp4" && !(OperatingSystem.IsWindows() && ExportFormats.IsAvailable(ExportFormat.Mp4))) || (name.StartsWith("jpeg sequence (WIC", StringComparison.Ordinal) && preferredJpeg == null))
+				sinks.Add(("mp4", () => ExportFormats.Open(ExportFormat.Mp4, Path.Combine(folder, "j.mp4"), w, h, 30, 85, 60)));
+			}
+			if (OperatingSystem.IsWindows() && ExportFormats.IsAvailable(ExportFormat.Mp4))
+			{
+				sinks.Add(("mp4, writer not throttling", OpenUnthrottledMp4(Path.Combine(folder, "k.mp4"), w, h)));
+			}
+			foreach ((string name, Func<IFrameSink> open) in sinks)
+			{
+				if (name.StartsWith("jpeg sequence (WIC", StringComparison.Ordinal) && preferredJpeg == null)
 				{
 					continue;
 				}
@@ -786,7 +786,10 @@ internal static class ExportChecks
 				string ratio = job.Targets[0].Sink is MovWriter movSink ? $", {(double)store.Count * w * h * 3 / Math.Max(1, movSink.FrameBytes):0.00} : 1 on the run's frames" : "";
 				Console.WriteLine($"  job to {name}: {clock.Elapsed.TotalMilliseconds / store.Count:0.0} ms per frame ({job.State}){ratio}");
 				ExportFormats.PreferredJpeg = preferredJpeg;
-				Mp4Writer.Throttle = true;
+				if (OperatingSystem.IsWindows())
+				{
+					Mp4Writer.Throttle = true;
+				}
 			}
 		}
 		finally
@@ -795,8 +798,117 @@ internal static class ExportChecks
 		}
 	}
 
+	/// <summary>The WIC codec called natively at 4:4:4 (the app's JPEG path on Windows), timed and compared with the in-house
+	/// encoder at the same quality; part of <see cref="Bench"/>.</summary>
+	[SupportedOSPlatform("windows")]
+	private static void BenchWic(int[] frame, int w, int h, JpegEncoder jpeg, string folder)
+	{
+		byte[] inHouse = jpeg.Encode(frame);
+		byte[] wic = [];
+		Time("jpeg encode by WIC (q 85)", () => wic = WicEncode(frame, w, h, 85), 5);
+		File.WriteAllBytes(Path.Combine(folder, "wic.jpg"), wic);
+		File.WriteAllBytes(Path.Combine(folder, "inhouse.jpg"), inHouse);
+		double wicDb = 0;
+		double inHouseDb = 0;
+		if (Ffmpeg != null)
+		{
+			byte[]? rgb = Decode(Path.Combine(folder, "wic.jpg"), w, h, out int n);
+			wicDb = rgb == null || n != 1 ? 0 : Psnr(rgb, frame, w, h);
+			rgb = Decode(Path.Combine(folder, "inhouse.jpg"), w, h, out n);
+			inHouseDb = rgb == null || n != 1 ? 0 : Psnr(rgb, frame, w, h);
+		}
+		Console.WriteLine($"    at quality 85: WIC {wic.Length / 1024} KB at {wicDb:0.0} dB, in-house {inHouse.Length / 1024} KB at {inHouseDb:0.0} dB");
+		foreach (int q in new[] { 50, 70, 95 })
+		{
+			byte[] a = WicEncode(frame, w, h, q);
+			byte[] b = new JpegEncoder(w, h, q).Encode(frame);
+			Console.WriteLine($"    at quality {q}: WIC {a.Length / 1024} KB, in-house {b.Length / 1024} KB");
+		}
+	}
+
+	/// <summary>
+	/// The ffmpeg writer outside Windows (2026-11-06): seven frames decoded back, the odd size padded to even by the last row
+	/// and column, the stream tagged BT.601 at studio range, the quality mapped onto the encoders' quantiser, and a file
+	/// ffmpeg cannot write reported with ffmpeg's own words.
+	/// </summary>
+	private static void CheckFfmpegMp4(Action<bool, string> check, string folder, int[][] frames, int w, int h)
+	{
+		string mp4Path = Path.Combine(folder, "seven-ffmpeg.mp4");
+		string encoder;
+		using (var mp4 = new FfmpegMp4Writer(mp4Path, w, h, 30, 80))
+		{
+			encoder = mp4.Encoder;
+			foreach (int[] frame in frames)
+			{
+				mp4.Add(frame);
+			}
+		}
+		Console.WriteLine("  mp4: ffmpeg's " + encoder + " at " + w + " x " + h + "; its H.264 encoders: " + string.Join(", ", FfmpegMp4Writer.AvailableEncoders()));
+		byte[] mp4Bytes = File.ReadAllBytes(mp4Path);
+		check(mp4Bytes.Length > 100 && Encoding.ASCII.GetString(mp4Bytes, 4, 4) == "ftyp", "mp4 by ffmpeg: ftyp box, " + mp4Bytes.Length + " bytes");
+		byte[]? rgb = Decode(mp4Path, w, h, out int count);
+		double psnr = rgb == null || count < 1 ? 0 : Psnr(rgb.AsSpan(0, w * h * 3), frames[0], w, h);
+		check(rgb != null && count == 7 && psnr > 25, "mp4 by ffmpeg: decodes 7 frames, the first at " + psnr.ToString("0.0", CultureInfo.InvariantCulture) + " dB (> 25)" + (rgb == null ? "" : ", got " + count));
+		string probe = Probe(mp4Path);
+		check(probe.Contains("width=" + ((w + 1) & ~1), StringComparison.Ordinal) && probe.Contains("height=" + ((h + 1) & ~1), StringComparison.Ordinal) && probe.Contains("pix_fmt=yuv420p", StringComparison.Ordinal)
+			&& probe.Contains("color_range=tv", StringComparison.Ordinal) && probe.Contains("color_space=smpte170m", StringComparison.Ordinal) && probe.Contains("has_b_frames=0", StringComparison.Ordinal),
+			"mp4 by ffmpeg: " + ((w + 1) & ~1) + " × " + ((h + 1) & ~1) + " (the odd size padded), 4:2:0, BT.601 at studio range, no B-frames (" + probe.Replace('\n', ' ').Trim() + ")");
+		check(FfmpegMp4Writer.QuantiserOf(70) == 23 && FfmpegMp4Writer.QuantiserOf(100) == 11 && FfmpegMp4Writer.QuantiserOf(1) == 51 && FfmpegMp4Writer.QuantiserOf(0) == 51,
+			"mp4 by ffmpeg: quality 70 is quantiser 23 (x264's default), 100 is 11, 1 and below 51");
+		string nowhere = Path.Combine(folder, "no such folder", "x.mp4");
+		string? error = null;
+		try
+		{
+			using var broken = new FfmpegMp4Writer(nowhere, w, h, 30, 80);
+			broken.Add(frames[0]);
+		}
+		catch (IOException ex)
+		{
+			error = ex.Message;
+		}
+		check(error != null && error.StartsWith("ffmpeg", StringComparison.Ordinal) && error.Contains("no such folder", StringComparison.Ordinal), "mp4 by ffmpeg: a file it cannot write fails with ffmpeg's words (" + error + ")");
+	}
+
+	/// <summary>The first video stream's facts by ffprobe beside ffmpeg (<c>key=value</c> lines), empty when there is no ffprobe.</summary>
+	private static string Probe(string path)
+	{
+		string ffprobe = Path.Combine(Path.GetDirectoryName(Ffmpeg!)!, OperatingSystem.IsWindows() ? "ffprobe.exe" : "ffprobe");
+		if (!File.Exists(ffprobe))
+		{
+			return "";
+		}
+		var info = new ProcessStartInfo(ffprobe) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+		foreach (string arg in new[] { "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,pix_fmt,color_range,color_space,has_b_frames", "-of", "default=noprint_wrappers=1", path })
+		{
+			info.ArgumentList.Add(arg);
+		}
+		using Process process = Process.Start(info)!;
+		Task<string> errors = process.StandardError.ReadToEndAsync();
+		string output = process.StandardOutput.ReadToEnd();
+		process.WaitForExit();
+		errors.Wait();
+		return output;
+	}
+
+	/// <summary>The Media Foundation writer's cost per frame; part of <see cref="Bench"/>.</summary>
+	[SupportedOSPlatform("windows")]
+	private static void BenchMp4(int[] frame, int w, int h, string folder)
+	{
+		using var mp4 = new Mp4Writer(Path.Combine(folder, "b.mp4"), w, h, 30, 85);
+		Console.WriteLine("  mp4: " + (mp4.Nv12Input ? "NV12" : "RGB32") + " in, " + mp4.Transforms + (mp4.HasDirect3D ? ", Direct3D device shared" : ", system memory") + "; hardware H.264 encoders registered: " + string.Join(", ", Mp4Writer.AvailableEncoders(hardwareOnly: true).DefaultIfEmpty("none")));
+		Time("mp4 frame (Media Foundation)", () => mp4.Add(frame), 10);
+	}
+
+	/// <summary>Opens an MP4 sink with the writer's throttle off, for the job bench; the job's loop turns it back on.</summary>
+	[SupportedOSPlatform("windows")]
+	private static Func<IFrameSink> OpenUnthrottledMp4(string path, int w, int h) => () =>
+	{
+		Mp4Writer.Throttle = false;
+		return ExportFormats.Open(ExportFormat.Mp4, path, w, h, 30, 85, 60);
+	};
+
 	/// <summary>The app's JPEG path: the WIC codec called natively at 4:4:4.</summary>
-	[System.Runtime.Versioning.SupportedOSPlatform("windows")]
+	[SupportedOSPlatform("windows")]
 	private static byte[] WicEncode(int[] frame, int w, int h, int quality) => new WicJpegEncoder(w, h, quality).Encode(frame);
 
 	/// <summary>The three components' sampling factor bytes from the SOF0 segment, or null when there is none.</summary>
@@ -915,8 +1027,8 @@ internal static class ExportChecks
 		return bytes;
 	}
 
-	/// <summary>Decodes a one-channel file with ffmpeg to 16-bit grey samples of w × h; null when ffmpeg failed or the size is off.</summary>
-	private static ushort[]? DecodeGray16(string path, int w, int h)
+	/// <summary>Decodes a one-channel file with ffmpeg to float grey samples of w × h; null when ffmpeg failed or the size is off.</summary>
+	private static float[]? DecodeGrayFloat(string path, int w, int h)
 	{
 		var info = new ProcessStartInfo(Ffmpeg!)
 		{
@@ -925,7 +1037,7 @@ internal static class ExportChecks
 			UseShellExecute = false,
 			CreateNoWindow = true,
 		};
-		foreach (string arg in new[] { "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "gray16le", "-" })
+		foreach (string arg in new[] { "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "grayf32le", "-" })
 		{
 			info.ArgumentList.Add(arg);
 		}
@@ -935,16 +1047,16 @@ internal static class ExportChecks
 		process.StandardOutput.BaseStream.CopyTo(output);
 		process.WaitForExit();
 		string error = errors.Result;
-		if (process.ExitCode != 0 || output.Length != (long)w * h * 2)
+		if (process.ExitCode != 0 || output.Length != (long)w * h * 4)
 		{
 			Console.WriteLine("  ffmpeg: exit " + process.ExitCode + ", " + output.Length + " bytes " + error.Trim());
 			return null;
 		}
 		byte[] bytes = output.ToArray();
-		var samples = new ushort[w * h];
+		var samples = new float[w * h];
 		for (int i = 0; i < samples.Length; i++)
 		{
-			samples[i] = BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(i * 2));
+			samples[i] = BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(i * 4));
 		}
 		return samples;
 	}

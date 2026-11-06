@@ -23,7 +23,7 @@ namespace WaveDudeNext.Engine;
 
 /// <summary>
 /// The part of the OpenCL 1.2 C interface that the GPU simulation needs, called directly from the ICD loader
-/// (OpenCL.dll on Windows, libOpenCL.so elsewhere; the import name "OpenCL" resolves to either) plus a few
+/// (OpenCL.dll on Windows, libOpenCL.so.1 on Linux, libOpenCL.so elsewhere; the import name "OpenCL" resolves to each) plus a few
 /// query helpers. OpenCL.dll is installed with the driver of the graphics card (NVIDIA, Intel and AMD all
 /// install it), so no extra package is needed. Names and parameters follow the C header
 /// (cl.h); <c>size_t</c> is an <see cref="IntPtr"/>, <c>cl_bitfield</c> a <c>ulong</c>, <c>cl_uint</c> a
@@ -34,6 +34,22 @@ namespace WaveDudeNext.Engine;
 /// </summary>
 internal static class OpenClApi
 {
+	/// <summary>
+	/// On Linux the loader is taken by its soname, <c>libOpenCL.so.1</c> (2026-11-06): the runtime probes the import name
+	/// as <c>libOpenCL.so</c>, a development link that a distribution splitting its packages installs only with the
+	/// headers; when the soname is missing too, the runtime's own probing follows. Runs before the first call into the
+	/// loader, this class having a static constructor; the resolver serves this library's other imports by returning
+	/// nothing for them.
+	/// </summary>
+	static OpenClApi()
+	{
+		if (OperatingSystem.IsLinux())
+		{
+			NativeLibrary.SetDllImportResolver(typeof(OpenClApi).Assembly, static (name, assembly, searchPath)
+				=> name == "OpenCL" && NativeLibrary.TryLoad("libOpenCL.so.1", assembly, searchPath, out IntPtr handle) ? handle : IntPtr.Zero);
+		}
+	}
+
 	// ---- platforms and devices
 
 	/// <summary>clGetPlatformIDs: with <paramref name="platforms"/> null only counts the platforms into <paramref name="numPlatforms"/>.</summary>
